@@ -1,0 +1,339 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+      - name: Create app files
+        run: |
+          mkdir -p app/src/main/java/com/example/autophoto
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "AutoPhoto"
+          include(":app")
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.7.3" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+          }
+          EOF
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          EOF
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.autophoto"
+              compileSdk = 35
+
+              defaultConfig {
+                  applicationId = "com.example.autophoto"
+                  minSdk = 29
+                  targetSdk = 35
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+
+          dependencies {
+              val camerax = "1.4.1"
+              implementation("androidx.core:core-ktx:1.15.0")
+              implementation("androidx.activity:activity-ktx:1.9.3")
+              implementation("androidx.camera:camera-core:$camerax")
+              implementation("androidx.camera:camera-camera2:$camerax")
+              implementation("androidx.camera:camera-lifecycle:$camerax")
+              implementation("androidx.camera:camera-view:$camerax")
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-feature android:name="android.hardware.camera.any" />
+              <uses-permission android:name="android.permission.CAMERA" />
+
+              <application
+                  android:label="Auto Photo"
+                  android:supportsRtl="true"
+                  android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="portrait">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+
+          </manifest>
+          EOF
+          cat > app/src/main/java/com/example/autophoto/MainActivity.kt <<'EOF'
+          package com.example.autophoto
+
+          import android.Manifest
+          import android.content.ContentValues
+          import android.content.pm.PackageManager
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.provider.MediaStore
+          import android.text.InputType
+          import android.view.Gravity
+          import android.view.View
+          import android.view.ViewGroup.LayoutParams.MATCH_PARENT
+          import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+          import android.view.WindowManager
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.activity.ComponentActivity
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.camera.core.CameraSelector
+          import androidx.camera.core.ImageCapture
+          import androidx.camera.core.ImageCaptureException
+          import androidx.camera.core.Preview
+          import androidx.camera.lifecycle.ProcessCameraProvider
+          import androidx.camera.view.PreviewView
+          import androidx.core.content.ContextCompat
+          import androidx.core.view.ViewCompat
+          import androidx.core.view.WindowCompat
+          import androidx.core.view.WindowInsetsCompat
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+
+          class MainActivity : ComponentActivity() {
+
+              private lateinit var previewView: PreviewView
+              private lateinit var secondsInput: EditText
+              private lateinit var startStop: Button
+              private lateinit var status: TextView
+
+              private var imageCapture: ImageCapture? = null
+              private var frontCamera = false
+              private var running = false
+              private var photoCount = 0
+              private var intervalMs = 5000L
+              private val handler = Handler(Looper.getMainLooper())
+
+              private val askCamera =
+                  registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+                      if (granted) startCamera() else toast("Camera ki permission ke bina app kaam nahi karega")
+                  }
+
+              // Har intervalMs ke baad ek photo khinchta hai
+              private val tick = object : Runnable {
+                  override fun run() {
+                      if (!running) return
+                      takePhoto()
+                      handler.postDelayed(this, intervalMs)
+                  }
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                  setContentView(buildUi())
+                  if (hasCameraPermission()) startCamera() else askCamera.launch(Manifest.permission.CAMERA)
+              }
+
+              override fun onStop() {
+                  super.onStop()
+                  if (running) {
+                      stopCapturing()
+                      toast("App background me gaya, isliye photo lena ruk gaya")
+                  }
+              }
+
+              private fun buildUi(): View {
+                  val pad = dp(16)
+                  previewView = PreviewView(this)
+
+                  secondsInput = EditText(this).apply {
+                      setText("5")
+                      inputType = InputType.TYPE_CLASS_NUMBER
+                      gravity = Gravity.CENTER
+                      textSize = 20f
+                  }
+                  val row = LinearLayout(this).apply {
+                      gravity = Gravity.CENTER
+                      addView(label("Har"))
+                      addView(secondsInput, LinearLayout.LayoutParams(dp(88), WRAP_CONTENT))
+                      addView(label("second me ek photo"))
+                  }
+
+                  startStop = Button(this).apply {
+                      text = "Start"
+                      setOnClickListener { if (running) stopCapturing() else startCapturing() }
+                  }
+                  val flip = Button(this).apply {
+                      text = "Camera badlo"
+                      setOnClickListener {
+                          frontCamera = !frontCamera
+                          if (hasCameraPermission()) startCamera()
+                      }
+                  }
+                  val buttons = LinearLayout(this).apply {
+                      addView(startStop, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+                      addView(flip, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+                  }
+                  status = label("Photos: 0").apply { gravity = Gravity.CENTER }
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      addView(previewView, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
+                      addView(row, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+                      addView(buttons, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+                      addView(status, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+                  }
+                  ViewCompat.setOnApplyWindowInsetsListener(root) { v, insets ->
+                      val bars = insets.getInsets(
+                          WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.ime()
+                      )
+                      v.setPadding(pad + bars.left, pad + bars.top, pad + bars.right, pad + bars.bottom)
+                      insets
+                  }
+                  return root
+              }
+
+              private fun startCamera() {
+                  val future = ProcessCameraProvider.getInstance(this)
+                  future.addListener({
+                      val provider = future.get()
+                      val preview = Preview.Builder().build()
+                          .also { it.setSurfaceProvider(previewView.surfaceProvider) }
+                      val capture = ImageCapture.Builder()
+                          .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+                          .build()
+                      val selector = if (frontCamera) CameraSelector.DEFAULT_FRONT_CAMERA
+                      else CameraSelector.DEFAULT_BACK_CAMERA
+                      try {
+                          provider.unbindAll()
+                          provider.bindToLifecycle(this, selector, preview, capture)
+                          imageCapture = capture
+                      } catch (e: Exception) {
+                          imageCapture = null
+                          toast("Ye camera nahi khul paya")
+                      }
+                  }, ContextCompat.getMainExecutor(this))
+              }
+
+              private fun startCapturing() {
+                  val seconds = secondsInput.text.toString().toLongOrNull()
+                  if (seconds == null || seconds < 1) {
+                      toast("Kam se kam 1 second dalo")
+                      return
+                  }
+                  if (imageCapture == null) {
+                      toast("Pehle camera chalu hone do")
+                      return
+                  }
+                  WindowCompat.getInsetsController(window, startStop).hide(WindowInsetsCompat.Type.ime())
+                  secondsInput.clearFocus()
+                  secondsInput.isEnabled = false
+                  intervalMs = seconds * 1000
+                  photoCount = 0
+                  running = true
+                  startStop.text = "Stop"
+                  status.text = "Photos: 0 (har $seconds second me)"
+                  handler.postDelayed(tick, intervalMs)
+              }
+
+              private fun stopCapturing() {
+                  running = false
+                  handler.removeCallbacks(tick)
+                  secondsInput.isEnabled = true
+                  startStop.text = "Start"
+              }
+
+              private fun takePhoto() {
+                  val capture = imageCapture ?: return
+                  val name = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
+                  val values = ContentValues().apply {
+                      put(MediaStore.Images.Media.DISPLAY_NAME, "IMG_$name")
+                      put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                      put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/AutoPhoto")
+                  }
+                  val options = ImageCapture.OutputFileOptions.Builder(
+                      contentResolver, MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values
+                  ).build()
+                  capture.takePicture(
+                      options,
+                      ContextCompat.getMainExecutor(this),
+                      object : ImageCapture.OnImageSavedCallback {
+                          override fun onImageSaved(output: ImageCapture.OutputFileResults) {
+                              photoCount++
+                              status.text = "Photos: $photoCount"
+                          }
+
+                          override fun onError(e: ImageCaptureException) {
+                              status.text = "Photo save nahi hui: ${e.message}"
+                          }
+                      }
+                  )
+              }
+
+              private fun hasCameraPermission() =
+                  ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) ==
+                      PackageManager.PERMISSION_GRANTED
+
+              private fun label(t: String) = TextView(this).apply {
+                  text = t
+                  textSize = 16f
+                  setPadding(dp(8), dp(8), dp(8), dp(8))
+              }
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+          }
+          EOF
+      - name: Accept Android licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses || true
+      - name: Build debug APK
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AutoPhoto-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+          
